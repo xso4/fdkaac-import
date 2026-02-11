@@ -1,0 +1,85 @@
+name: Sync Source From Upstream
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '36 12 11 * *'
+permissions:
+  contents: write
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    env:
+      FDKAAC_TOKEN: ${{ secrets.FDKAAC_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FDKAAC_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate workflows token
+        run: |
+          if [ -z "$FDKAAC_TOKEN" ]; then
+            echo "Error: FDKAAC_TOKEN is required to update workflow files in source branch."
+            exit 1
+          fi
+
+      - name: Sync source branch with upstream
+        run: |
+          git remote remove upstream >/dev/null 2>&1 || true
+          git remote add upstream https://github.com/nu774/fdkaac.git
+
+          git remote set-url origin "https://x-access-token:${FDKAAC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          UPSTREAM_DEFAULT=$(git ls-remote --symref upstream HEAD | awk '/^ref: refs\/heads\// {print $2}' | sed 's|^refs/heads/||')
+          if [ -z "$UPSTREAM_DEFAULT" ]; then
+            echo "Error: Could not detect upstream default branch"
+            exit 1
+          fi
+          echo "Upstream default branch is $UPSTREAM_DEFAULT"
+          
+          git fetch upstream "$UPSTREAM_DEFAULT"
+
+          git remote set-head origin -a >/dev/null 2>&1 || true
+          ORIGIN_DEFAULT=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+          if [ -z "$ORIGIN_DEFAULT" ]; then
+            ORIGIN_DEFAULT="${GITHUB_REF_NAME:-}"
+          fi
+          if [ -z "$ORIGIN_DEFAULT" ]; then
+            ORIGIN_DEFAULT="${GITHUB_REF##*/}"
+          fi
+          if [ -z "$ORIGIN_DEFAULT" ]; then
+            echo "Error: Could not detect origin default branch"
+            exit 1
+          fi
+          echo "Origin default branch is $ORIGIN_DEFAULT"
+
+          git fetch origin "$ORIGIN_DEFAULT"
+          git checkout -B "$ORIGIN_DEFAULT" "origin/$ORIGIN_DEFAULT"
+
+          BACKUP_DIR="/tmp/github-backup"
+          rm -rf "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR"
+          if [ -d .github ]; then
+            cp -a .github/. "$BACKUP_DIR/"
+          fi
+
+          git reset --hard "upstream/$UPSTREAM_DEFAULT"
+
+          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A "$BACKUP_DIR")" ]; then
+            rm -rf .github
+            mkdir -p .github
+            cp -a "$BACKUP_DIR/." .github/
+          fi
+
+          git add .github
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: sync upstream and restore .github"
+          fi
+
+          git push -f origin "$ORIGIN_DEFAULT"

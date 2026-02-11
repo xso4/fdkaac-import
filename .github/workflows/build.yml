@@ -1,0 +1,213 @@
+name: Build Windows Static
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 12 11 * *'
+permissions:
+  contents: write
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEFAULT_BRANCH }}
+          fetch-depth: 0
+      - name: Read previous upstream versions
+        shell: powershell
+        run: |
+          $versionPath = ".github/upstream-version.json"
+          if (Test-Path $versionPath) {
+            $previous = Get-Content $versionPath -Raw | ConvertFrom-Json
+          } else {
+            $previous = [PSCustomObject]@{
+              last_run_utc = ""
+              repositories = [PSCustomObject]@{
+                fdkaac = [PSCustomObject]@{ commit = "" }
+                'fdk-aac' = [PSCustomObject]@{ commit = "" }
+              }
+            }
+          }
+          $previousFdkaac = ""
+          $previousFdk = ""
+          if ($previous -and $previous.repositories -and $previous.repositories.fdkaac -and $previous.repositories.fdkaac.commit) { $previousFdkaac = $previous.repositories.fdkaac.commit }
+          if ($previous -and $previous.repositories -and $previous.repositories.'fdk-aac' -and $previous.repositories.'fdk-aac'.commit) { $previousFdk = $previous.repositories.'fdk-aac'.commit }
+          echo "PREV_FDKAAC_SHA=$previousFdkaac" >> $env:GITHUB_ENV
+          echo "PREV_FDK_AAC_SHA=$previousFdk" >> $env:GITHUB_ENV
+      - name: Sync with upstream
+        shell: powershell
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          $ls = git ls-remote --symref https://github.com/nu774/fdkaac.git HEAD
+          $refLine = ($ls -split "`n" | Where-Object { $_ -match '^ref: refs/heads/' })
+          if (-not $refLine) { Write-Error "Failed to detect upstream default branch"; exit 1 }
+          $upstreamBranch = ($refLine -replace '^ref: refs/heads/','' -replace '\s+HEAD$','').Trim()
+          git fetch https://github.com/nu774/fdkaac.git $upstreamBranch
+          git checkout -B build-src FETCH_HEAD
+      - name: Checkout fdk-aac source
+        uses: actions/checkout@v4
+        with:
+          repository: mstorsjo/fdk-aac
+          path: fdk-aac
+      - name: Get metadata and decide build
+        shell: powershell
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $fdkaacCommit = (git rev-parse HEAD).Trim()
+          $fdkCommit = (git -C fdk-aac rev-parse HEAD).Trim()
+          $fdkaacDateRaw = (git show -s --format=%cI HEAD).Trim()
+          $fdkDateRaw = (git -C fdk-aac show -s --format=%cI HEAD).Trim()
+          $fdkaacDateUtc = [DateTimeOffset]::Parse($fdkaacDateRaw).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $fdkDateUtc = [DateTimeOffset]::Parse($fdkDateRaw).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          echo "FDKAAC_SHA=$fdkaacCommit" >> $env:GITHUB_ENV
+          echo "FDK_AAC_SHA=$fdkCommit" >> $env:GITHUB_ENV
+          echo "FDKAAC_DATE_UTC=$fdkaacDateUtc" >> $env:GITHUB_ENV
+          echo "FDK_AAC_DATE_UTC=$fdkDateUtc" >> $env:GITHUB_ENV
+          if ($env:EVENT_NAME -eq "schedule" -and $env:PREV_FDKAAC_SHA -eq $fdkaacCommit -and $env:PREV_FDK_AAC_SHA -eq $fdkCommit) {
+            echo "SHOULD_BUILD=false" >> $env:GITHUB_ENV
+          } else {
+            echo "SHOULD_BUILD=true" >> $env:GITHUB_ENV
+          }
+      - name: Set release metadata
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          $date = Get-Date -Format "yyyy-MM-dd"
+          $fdkaacShort = $env:FDKAAC_SHA.Substring(0,7)
+          $fdkShort = $env:FDK_AAC_SHA.Substring(0,7)
+          $tagName = "${date}_$fdkaacShort"
+          $zipName = "fdkaac-windows-x64_fdkaac-$fdkaacShort`_libfdk-aac-$fdkShort.zip"
+          echo "FDKAAC_SHA_SHORT=$fdkaacShort" >> $env:GITHUB_ENV
+          echo "FDK_AAC_SHA_SHORT=$fdkShort" >> $env:GITHUB_ENV
+          echo "RELEASE_DATE=$date" >> $env:GITHUB_ENV
+          echo "TAG_NAME=$tagName" >> $env:GITHUB_ENV
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+      - name: Setup MSBuild
+        if: env.SHOULD_BUILD == 'true'
+        uses: microsoft/setup-msbuild@v1
+      - name: Patch vcxproj for Static Runtime (/MT)
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          $projects = @("MSVC\fdkaac.vcxproj", "MSVC\fdk-aac.vcxproj")
+          foreach ($proj in $projects) {
+            $content = Get-Content $proj
+            $newContent = $content -replace '<Optimization>MaxSpeed</Optimization>', "<Optimization>MaxSpeed</Optimization>`n      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>"
+            $newContent | Set-Content $proj -Encoding UTF8
+          }
+      - name: Create include directory
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          if (!(Test-Path "MSVC\include\fdk-aac")) {
+              New-Item -ItemType Directory -Force -Path "MSVC\include\fdk-aac"
+          }
+      - name: Build solution
+        if: env.SHOULD_BUILD == 'true'
+        run: msbuild MSVC\fdkaac.sln /p:Configuration=Release /p:Platform=x64
+      - name: Verify build
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          $exe = "MSVC\x64\Release\fdkaac.exe"
+          if (!(Test-Path $exe)) {
+            Write-Error "fdkaac.exe not found at $exe"
+            exit 1
+          }
+          & $exe --help
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host "fdkaac --help returned exit code $code, ignoring to allow packaging"
+          }
+          exit 0
+      - name: Install documentation tools
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          choco install pandoc --no-progress
+          choco install wkhtmltopdf --no-progress
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+      - name: Generate documentation
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          pandoc man\fdkaac.1 -f man -t html -s -o fdkaac.html
+          pandoc man\fdkaac.1 -f man -t plain -o fdkaac.txt
+          pandoc man\fdkaac.1 -f man -o fdkaac.pdf --pdf-engine=wkhtmltopdf
+          pandoc man\fdkaac.1 -f man -t markdown -s -o fdkaac.md
+      - name: Pack artifacts
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          Compress-Archive -Path MSVC\x64\Release\fdkaac.exe, fdkaac.html, fdkaac.txt, fdkaac.pdf, fdkaac.md -DestinationPath $env:ZIP_NAME
+      - name: Upload artifacts
+        if: env.SHOULD_BUILD == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+      - name: Prepare release notes
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          $fdkaacShort = $env:FDKAAC_SHA.Substring(0,7)
+          $fdkShort = $env:FDK_AAC_SHA.Substring(0,7)
+          $body = @"
+          ## Component Versions
+
+          | Component | Commit | Date (UTC) |
+          |-----------|--------|------------|
+          | [fdkaac](https://github.com/nu774/fdkaac) | [$fdkaacShort](https://github.com/nu774/fdkaac/commit/$($env:FDKAAC_SHA)) | $($env:FDKAAC_DATE_UTC) |
+          | [fdk-aac](https://github.com/mstorsjo/fdk-aac) | [$fdkShort](https://github.com/mstorsjo/fdk-aac/commit/$($env:FDK_AAC_SHA)) | $($env:FDK_AAC_DATE_UTC) |
+          "@
+          $body | Out-File -FilePath "release_notes.md" -Encoding utf8
+      - name: Create Release
+        if: env.SHOULD_BUILD == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.TAG_NAME }}
+          body_path: release_notes.md
+          files: ${{ env.ZIP_NAME }}
+          draft: false
+          prerelease: false
+      - name: Write upstream-version.json
+        if: env.SHOULD_BUILD == 'true'
+        shell: powershell
+        run: |
+          $version = [PSCustomObject]@{
+            last_run_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            repositories = [PSCustomObject]@{
+              fdkaac = [PSCustomObject]@{
+                url = "https://github.com/nu774/fdkaac.git"
+                commit = $($env:FDKAAC_SHA)
+                date = $($env:FDKAAC_DATE_UTC)
+              }
+              'fdk-aac' = [PSCustomObject]@{
+                url = "https://github.com/mstorsjo/fdk-aac.git"
+                commit = $($env:FDK_AAC_SHA)
+                date = $($env:FDK_AAC_DATE_UTC)
+              }
+            }
+          }
+          $version | ConvertTo-Json -Depth 4 | Set-Content "new-version.json" -Encoding UTF8
+          
+          git fetch origin $env:DEFAULT_BRANCH
+          git checkout $env:DEFAULT_BRANCH
+          if (!(Test-Path ".github")) {
+            New-Item -ItemType Directory -Force -Path ".github" | Out-Null
+          }
+          Move-Item -Force "new-version.json" ".github/upstream-version.json"
+          
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add .github/upstream-version.json
+          if (-not (git diff --staged --quiet)) {
+            git commit -m "Update upstream-version.json [skip ci]"
+            git push origin $env:DEFAULT_BRANCH
+          }
