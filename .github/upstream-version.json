@@ -1,0 +1,15 @@
+{
+  "last_run_utc": "2026-02-14T16:18:52Z",
+  "repositories": {
+    "fdkaac": {
+      "url": "https://github.com/nu774/fdkaac.git",
+      "commit": "98d90e76d6b47e9ecf8fb763e08720a26354ae20",
+      "date": "2024-05-05T16:03:58Z"
+    },
+    "fdk-aac": {
+      "url": "https://github.com/mstorsjo/fdk-aac.git",
+      "commit": "d8e6b1a3aa606c450241632b64b703f21ea31ce3",
+      "date": "2025-08-21T09:01:07Z"
+    }
+  }
+}
