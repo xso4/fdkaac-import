@@ -22,6 +22,7 @@ stamp-h1
 fdkaac
 .vscode
 fdk-aac
+build/
 MSVC/Release
 MSVC/Debug
 MSVC/x64/Release
