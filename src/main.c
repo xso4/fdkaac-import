@@ -512,24 +512,72 @@ int write_sample(FILE *ofp, m4af_ctx_t *m4af, aacenc_frame_t *frame)
 
 static int do_smart_padding(int profile)
 {
-    return profile == 2 || profile == 5 || profile == 29;
+    return profile == 2 || profile == 5 || profile == 29 ||
+           profile == 23 || profile == 39;
+}
+
+/*
+ * With smart padding, extrapolater_open() inserts one AAC frame's worth
+ * of extrapolated samples before and after the real audio (see its
+ * comment for why that's a plain PCM-domain sample count, unrelated to
+ * how encode()'s own read/write chunking works). Near each boundary the
+ * encoder's own output is a mix of pure algorithmic-delay artifact and
+ * our synthetic pad, and exactly one head frame turns out to be pure
+ * filler that's safe to drop outright; the gapless delay/padding values
+ * computed after encode() returns don't need any adjustment for this,
+ * since removing one whole frame's worth of encoded audio shifts the
+ * decoded timeline back by exactly the one frame's worth of pad we
+ * added, leaving the encoder's own delay as the correct value either
+ * way. Normally that's simply the very first frame (nothing needs it),
+ * but when SBR is active frame #1 must survive since it carries the SBR
+ * header, so frame #2 is sacrificed instead -- safe as long as the
+ * encoder's own delay covers at least those two frames, which holds for
+ * every SBR profile except ELD, whose delay can be shorter than even a
+ * single frame. There, discarding frame #2 would splice real content
+ * together, so instead nothing is discarded at the head at all; see
+ * smart_padding_delay_extension() for how the signaled delay accounts
+ * for that. The trailing pad frame needs no such carve-out and is
+ * simply the last frame produced, which pending-frame draining below
+ * never gets around to writing.
+ */
+static int pad_head_discard_index(int profile, int sbr_active)
+{
+    if (!sbr_active)
+        return 1;
+    return profile == AOT_ER_AAC_ELD ? 0 : 2;
+}
+
+/*
+ * Extra samples to add to the signaled (gapless) delay for cases where
+ * pad_head_discard_index() above discards nothing at the head: since no
+ * frame was physically removed there, the one frame's worth of pad we
+ * added is still sitting in the encoded audio and must be skipped via
+ * metadata instead.
+ */
+static uint32_t smart_padding_delay_extension(int profile, int sbr_active,
+                                              uint32_t frame_length)
+{
+    return pad_head_discard_index(profile, sbr_active) == 0 ? frame_length : 0;
 }
 
 static
 int encode(aacenc_param_ex_t *params, pcm_reader_t *reader,
-           HANDLE_AACENCODER encoder, uint32_t frame_length, 
-           m4af_ctx_t *m4af)
+           HANDLE_AACENCODER encoder, uint32_t frame_length,
+           m4af_ctx_t *m4af, int sbr_active)
 {
     INT_PCM *ibuf = 0, *ip;
-    aacenc_frame_t obuf[2] = {{ 0 }}, *obp;
-    unsigned flip = 0;
+    aacenc_frame_t obp = { 0 };
+    aacenc_frame_t pending = { 0 };
+    int have_pending = 0;
     int nread = 1;
     int rc = -1;
     int remaining, consumed;
-    int frames_written = 0, encoded = 0;
+    int frames_written = 0, frame_index = 0;
     aacenc_progress_t progress = { 0 };
     const pcm_sample_description_t *fmt = pcm_get_format(reader);
     const int is_padding = do_smart_padding(params->profile);
+    const int head_discard = pad_head_discard_index(params->profile,
+                                                     sbr_active);
 
     ibuf = malloc(frame_length * fmt->bytes_per_frame);
     aacenc_progress_init(&progress, pcm_get_length(reader), fmt->sample_rate);
@@ -549,40 +597,48 @@ int encode(aacenc_param_ex_t *params, pcm_reader_t *reader,
         ip = ibuf;
         remaining = nread;
         do {
-            obp = &obuf[flip];
-            consumed = aac_encode_frame(encoder, fmt, ip, remaining, obp);
+            consumed = aac_encode_frame(encoder, fmt, ip, remaining, &obp);
             if (consumed < 0) goto END;
-            if (consumed == 0 && obp->size == 0) goto DONE;
-            if (obp->size == 0) break;
+            if (consumed == 0 && obp.size == 0) goto DONE;
+            if (obp.size == 0) break;
 
             remaining -= consumed;
             ip += consumed * fmt->channels_per_frame;
-            if (is_padding) {
-            /*
-             * As we pad 1 frame at beginning and ending by our extrapolator,
-             * we want to drop them.
-             * We delay output by 1 frame by double buffering, and discard
-             * second frame and final frame from the encoder.
-             * Since sbr_header is included in the first frame (in case of
-             * SBR), we cannot discard first frame. So we pick second instead.
-             */
-                flip ^= 1;
-                ++encoded;
-                if (encoded == 1 || encoded == 3)
-                    continue;
+
+            if (!is_padding) {
+                if (write_sample(params->output_fp, m4af, &obp) < 0)
+                    goto END;
+                ++frames_written;
+                continue;
             }
-            if (write_sample(params->output_fp, m4af, &obuf[flip]) < 0)
-                goto END;
-            ++frames_written;
+
+            /*
+             * Hold every frame back by one step, so that once the source
+             * is exhausted we can recognize -- and simply never write --
+             * whichever frame turns out to be the last one.
+             */
+            ++frame_index;
+            if (have_pending && frame_index - 1 != head_discard) {
+                if (write_sample(params->output_fp, m4af, &pending) < 0)
+                    goto END;
+                ++frames_written;
+            }
+            {
+                aacenc_frame_t tmp = pending;
+                pending = obp;
+                obp = tmp;
+            }
+            have_pending = 1;
         } while (remaining > 0);
     }
 DONE:
     /*
-     * When interrupted, we haven't pulled out last extrapolated frames
-     * from the reader. Therefore, we have to write the final outcome.
+     * When interrupted, the trailing pad frame was never pulled out of
+     * the reader, so whatever's pending here is genuine audio rather
+     * than padding -- flush it instead of dropping it.
      */
-    if (g_interrupted) {
-        if (write_sample(params->output_fp, m4af, &obp[flip^1]) < 0)
+    if (g_interrupted && have_pending) {
+        if (write_sample(params->output_fp, m4af, &pending) < 0)
             goto END;
         ++frames_written;
     }
@@ -591,8 +647,8 @@ DONE:
     rc = frames_written;
 END:
     if (ibuf) free(ibuf);
-    if (obuf[0].data) free(obuf[0].data);
-    if (obuf[1].data) free(obuf[1].data);
+    if (obp.data) free(obp.data);
+    if (pending.data) free(pending.data);
     return rc;
 }
 
@@ -765,10 +821,8 @@ pcm_reader_t *open_input(aacenc_param_ex_t *params)
     reader = pcm_open_native_converter(reader);
     if (reader && PCM_IS_FLOAT(pcm_get_format(reader)))
         reader = limiter_open(reader);
-    if (reader && (reader = pcm_open_sint16_converter(reader)) != 0) {
-        if (do_smart_padding(params->profile))
-            reader = extrapolater_open(reader);
-    }
+    if (reader)
+        reader = pcm_open_sint16_converter(reader);
     return reader;
 FAIL:
     return 0;
@@ -822,6 +876,20 @@ int main(int argc, char **argv)
                     &aacinfo) < 0)
         goto END;
 
+    if (do_smart_padding(params.profile)) {
+        /*
+         * Extrapolate one AAC frame's worth of samples at each end so the
+         * encoder gets real-ish context instead of a hard edge; this can
+         * only be sized once we know the encoder's frame length.
+         */
+        pcm_reader_t *padded = extrapolater_open(reader, aacinfo.frameLength);
+        if (!padded) {
+            fprintf(stderr, "ERROR: failed to allocate padding buffers\n");
+            goto END;
+        }
+        reader = padded;
+    }
+
     if (!params.output_filename) {
         const char *ext = params.transport_format ? ".aac" : ".m4a";
         output_filename = generate_output_filename(params.input_filename, ext);
@@ -858,22 +926,45 @@ int main(int argc, char **argv)
         m4af_set_priming_mode(m4af, params.gapless_mode + 1);
         m4af_begin_write(m4af);
     }
-    frame_count = encode(&params, reader, encoder, aacinfo.frameLength, m4af);
+    frame_count = encode(&params, reader, encoder, aacinfo.frameLength, m4af,
+                         sbr_mode);
     if (frame_count < 0)
         goto END;
     if (m4af) {
         uint32_t padding;
+        uint32_t sbr_extra_delay; /* SBR's own extra delay component, on
+                                   * top of the core codec delay -- only
+                                   * needed by smart_padding_delay_extension()
+                                   * below, whose "discard nothing, signal
+                                   * it all" strategy has no slack to
+                                   * absorb it the way a physical frame
+                                   * discard would                        */
 #if AACENCODER_LIB_VL0 < 4
         uint32_t delay = aacinfo.encoderDelay;
+        /*
+         * This library version doesn't break the delay down for ELD, so
+         * there's no verified extra SBR delay component to add back for
+         * it below -- leave it at 0, matching how ELD was already
+         * excluded from the adjustment just below.
+         */
+        sbr_extra_delay = 0;
         if (sbr_mode && params.profile != AOT_ER_AAC_ELD
             && !params.include_sbr_delay)
             delay -= 481 << scale_shift;
 #else
         uint32_t delay = params.include_sbr_delay ? aacinfo.nDelay
                                                   : aacinfo.nDelayCore;
+        sbr_extra_delay = aacinfo.nDelay - aacinfo.nDelayCore;
 #endif
         int64_t frames_read = pcm_get_position(reader);
 
+        if (do_smart_padding(params.profile)) {
+            uint32_t pad_ext = smart_padding_delay_extension(
+                    params.profile, sbr_mode, aacinfo.frameLength);
+            if (pad_ext && !params.include_sbr_delay)
+                delay += sbr_extra_delay;
+            delay += pad_ext;
+        }
         padding = frame_count * aacinfo.frameLength - frames_read - delay;
         m4af_set_priming(m4af, 0, delay >> scale_shift, padding >> scale_shift);
         if (finalize_m4a(m4af, &params, encoder) < 0)
