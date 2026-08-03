@@ -470,6 +470,9 @@ int parse_options(int argc, char **argv, aacenc_param_ex_t *params)
     if (argc == optind)
         return usage(), -1;
 
+    if (!params->profile)
+        params->profile = AOT_AAC_LC;
+
     if (!params->bitrate && !params->bitrate_mode) {
         fprintf(stderr, "bitrate or bitrate-mode is mandatory\n");
         return -1;
