@@ -1,0 +1,133 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '36 12 11 * *'
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 上游地址
+        required: false
+        type: string
+      upstream_branch:
+        description: 上游分支
+        required: false
+        type: string
+      origin_branch:
+        description: 本仓库分支
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FDKAAC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync source branch with upstream
+        run: |
+          UPSTREAM_REPO_INPUT="${{ github.event.inputs.upstream_repo }}"
+          UPSTREAM_REPO_OVERRIDE="https://github.com/nu774/fdkaac.git"
+          UPSTREAM_REPO="$UPSTREAM_REPO_INPUT"
+          if [ -z "$UPSTREAM_REPO" ]; then
+            UPSTREAM_REPO="$UPSTREAM_REPO_OVERRIDE"
+          fi
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "Error: Could not detect upstream repository"
+            exit 1
+          fi
+
+          git remote remove upstream >/dev/null 2>&1 || true
+          git remote add upstream "$UPSTREAM_REPO"
+
+          git remote set-url origin "https://x-access-token:${{ secrets.FDKAAC_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          UPSTREAM_BRANCH_INPUT="${{ github.event.inputs.upstream_branch }}"
+          UPSTREAM_BRANCH_OVERRIDE=""
+          UPSTREAM_DEFAULT="$UPSTREAM_BRANCH_INPUT"
+          if [ -z "$UPSTREAM_DEFAULT" ]; then
+            UPSTREAM_DEFAULT="$UPSTREAM_BRANCH_OVERRIDE"
+          fi
+          if [ -z "$UPSTREAM_DEFAULT" ]; then
+            UPSTREAM_DEFAULT=$(git ls-remote --symref upstream HEAD | awk '/^ref: refs\/heads\// {print $2}' | sed 's|^refs/heads/||')
+          fi
+          if [ -z "$UPSTREAM_DEFAULT" ]; then
+            echo "Error: Could not detect upstream default branch"
+            exit 1
+          fi
+          echo "Upstream default branch is $UPSTREAM_DEFAULT"
+          
+          git fetch upstream "$UPSTREAM_DEFAULT"
+
+          ORIGIN_INPUT="${{ github.event.inputs.origin_branch }}"
+          ORIGIN_OVERRIDE=""
+          ORIGIN_DEFAULT="$ORIGIN_INPUT"
+          if [ -z "$ORIGIN_DEFAULT" ]; then
+            ORIGIN_DEFAULT="$ORIGIN_OVERRIDE"
+          fi
+          if [ -z "$ORIGIN_DEFAULT" ]; then
+            ORIGIN_DEFAULT="${DEFAULT_BRANCH:-}"
+          fi
+          if [ -z "$ORIGIN_DEFAULT" ]; then
+            echo "Error: Could not detect origin default branch"
+            exit 1
+          fi
+          echo "Origin default branch is $ORIGIN_DEFAULT"
+
+          git fetch origin "$ORIGIN_DEFAULT"
+          git checkout -B "$ORIGIN_DEFAULT" "origin/$ORIGIN_DEFAULT"
+
+          # 1. Backup local .github directory (contains workflows and scripts)
+          # This ensures we don't lose our custom CI configurations and upstream-version.json
+          BACKUP_DIR="/tmp/github-backup"
+          rm -rf "$BACKUP_DIR"
+          mkdir -p "$BACKUP_DIR"
+          if [ -d .github ]; then
+            cp -a .github/. "$BACKUP_DIR/"
+          fi
+
+          # 2. Hard reset to upstream default branch
+          # This forces the codebase to be exactly like upstream
+          git reset --hard "upstream/$UPSTREAM_DEFAULT"
+
+          # 3. Restore .github directory from backup
+          # We remove any .github directory that might have come from upstream (to avoid conflicts/pollution)
+          # and restore our own fully.
+          if [ -d "$BACKUP_DIR" ] && [ "$(ls -A "$BACKUP_DIR")" ]; then
+            mkdir -p .github
+            while IFS= read -r -d '' item; do
+              src="$BACKUP_DIR/$item"
+              dest=".github/$item"
+              if [ ! -e "$dest" ]; then
+                if [ -d "$src" ]; then
+                  mkdir -p "$dest"
+                  cp -a "$src/." "$dest/"
+                else
+                  mkdir -p "$(dirname "$dest")"
+                  cp -a "$src" "$dest"
+                fi
+              fi
+            done < <(cd "$BACKUP_DIR" && find . -mindepth 1 -print0)
+          fi
+
+          # 4. Commit and push changes if any
+          git add .github
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: sync upstream and restore .github"
+          fi
+
+          git push -f origin "$ORIGIN_DEFAULT"
